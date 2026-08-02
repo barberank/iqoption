@@ -69,6 +69,33 @@ def download_candles(
     return frame[wanted].sort_values("datetime")
 
 
+def add_indicators(frame: pd.DataFrame) -> pd.DataFrame:
+    if "close" not in frame.columns:
+        raise RuntimeError("No existe la columna close para calcular indicadores")
+
+    if len(frame) < 21:
+        raise RuntimeError("Se necesitan al menos 21 velas para calcular los indicadores")
+
+    result = frame.copy()
+    close = pd.to_numeric(result["close"], errors="coerce")
+
+    if close.isna().any():
+        raise RuntimeError("Hay valores inválidos en los precios de cierre")
+
+    result["ema9"] = close.ewm(span=9, adjust=False).mean()
+    result["ema21"] = close.ewm(span=21, adjust=False).mean()
+
+    delta = close.diff()
+    gains = delta.clip(lower=0)
+    losses = -delta.clip(upper=0)
+    average_gain = gains.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+    average_loss = losses.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+    relative_strength = average_gain / average_loss.replace(0, float("nan"))
+    result["rsi14"] = 100 - (100 / (1 + relative_strength))
+
+    return result
+
+
 @app.get("/")
 def home():
     return jsonify(
@@ -76,7 +103,7 @@ def home():
             "status": "ok",
             "service": "IQ Option AI MVP",
             "mode": "PRACTICE_ONLY",
-            "message": "API online. Usá /api/candles para consultar velas demo.",
+            "message": "API online. Usá /api/candles o /api/indicators.",
         }
     )
 
@@ -114,6 +141,45 @@ def candles_api():
                 "count": len(records),
                 "balance": iq.get_balance(),
                 "candles": records,
+            }
+        )
+    except ValueError:
+        return jsonify({"status": "error", "error": "Parámetros numéricos inválidos"}), 400
+    except Exception as exc:
+        return jsonify({"status": "error", "error": str(exc)}), 500
+
+
+@app.get("/api/indicators")
+def indicators_api():
+    try:
+        email = require_env("IQ_EMAIL")
+        password = require_env("IQ_PASSWORD")
+        asset = request.args.get("asset", os.getenv("IQ_ASSET", "EURUSD")).strip().upper()
+        timeframe = int(request.args.get("timeframe", os.getenv("IQ_TIMEFRAME", "60")))
+        count = int(request.args.get("count", os.getenv("IQ_CANDLE_COUNT", "1000")))
+
+        if timeframe not in {5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600}:
+            return jsonify({"status": "error", "error": "Timeframe no permitido"}), 400
+
+        if count < 21 or count > 1000:
+            return jsonify({"status": "error", "error": "count debe estar entre 21 y 1000"}), 400
+
+        iq = connect_practice(email, password)
+        frame = add_indicators(download_candles(iq, asset, timeframe, count))
+        latest = frame.iloc[-1]
+
+        return jsonify(
+            {
+                "status": "ok",
+                "mode": "PRACTICE_ONLY",
+                "asset": asset,
+                "timeframe": timeframe,
+                "count": len(frame),
+                "datetime": str(latest["datetime"]),
+                "close": round(float(latest["close"]), 6),
+                "ema9": round(float(latest["ema9"]), 6),
+                "ema21": round(float(latest["ema21"]), 6),
+                "rsi14": None if pd.isna(latest["rsi14"]) else round(float(latest["rsi14"]), 2),
             }
         )
     except ValueError:
