@@ -11,6 +11,8 @@ from iqoptionapi.stable_api import IQ_Option
 load_dotenv()
 app = Flask(__name__)
 
+ALLOWED_TIMEFRAMES = {5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600}
+
 
 def require_env(name: str) -> str:
     value = os.getenv(name, "").strip()
@@ -96,6 +98,48 @@ def add_indicators(frame: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+def calculate_signal(frame: pd.DataFrame) -> tuple[str, str]:
+    if len(frame) < 2:
+        raise RuntimeError("Se necesitan al menos dos velas con indicadores")
+
+    previous = frame.iloc[-2]
+    latest = frame.iloc[-1]
+
+    if pd.isna(previous["rsi14"]) or pd.isna(latest["rsi14"]):
+        return "NO_TRADE", "RSI todavía no disponible"
+
+    bullish_cross = (
+        previous["ema9"] <= previous["ema21"]
+        and latest["ema9"] > latest["ema21"]
+    )
+    bearish_cross = (
+        previous["ema9"] >= previous["ema21"]
+        and latest["ema9"] < latest["ema21"]
+    )
+
+    if bullish_cross and 50 <= latest["rsi14"] <= 70:
+        return "CALL", "Cruce alcista EMA 9/21 con RSI entre 50 y 70"
+
+    if bearish_cross and 30 <= latest["rsi14"] <= 50:
+        return "PUT", "Cruce bajista EMA 9/21 con RSI entre 30 y 50"
+
+    return "NO_TRADE", "No se cumplen simultáneamente las reglas de entrada"
+
+
+def request_market_parameters(min_count: int = 1) -> tuple[str, int, int]:
+    asset = request.args.get("asset", os.getenv("IQ_ASSET", "EURUSD")).strip().upper()
+    timeframe = int(request.args.get("timeframe", os.getenv("IQ_TIMEFRAME", "60")))
+    count = int(request.args.get("count", os.getenv("IQ_CANDLE_COUNT", "1000")))
+
+    if timeframe not in ALLOWED_TIMEFRAMES:
+        raise ValueError("Timeframe no permitido")
+
+    if count < min_count or count > 1000:
+        raise ValueError(f"count debe estar entre {min_count} y 1000")
+
+    return asset, timeframe, count
+
+
 @app.get("/")
 def home():
     return jsonify(
@@ -103,7 +147,7 @@ def home():
             "status": "ok",
             "service": "IQ Option AI MVP",
             "mode": "PRACTICE_ONLY",
-            "message": "API online. Usá /api/candles o /api/indicators.",
+            "message": "API online. Usá /api/candles, /api/indicators o /api/signal.",
         }
     )
 
@@ -118,15 +162,7 @@ def candles_api():
     try:
         email = require_env("IQ_EMAIL")
         password = require_env("IQ_PASSWORD")
-        asset = request.args.get("asset", os.getenv("IQ_ASSET", "EURUSD")).strip().upper()
-        timeframe = int(request.args.get("timeframe", os.getenv("IQ_TIMEFRAME", "60")))
-        count = int(request.args.get("count", os.getenv("IQ_CANDLE_COUNT", "100")))
-
-        if timeframe not in {5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600}:
-            return jsonify({"status": "error", "error": "Timeframe no permitido"}), 400
-
-        if count < 1 or count > 1000:
-            return jsonify({"status": "error", "error": "count debe estar entre 1 y 1000"}), 400
+        asset, timeframe, count = request_market_parameters(min_count=1)
 
         iq = connect_practice(email, password)
         frame = download_candles(iq, asset, timeframe, count)
@@ -143,8 +179,8 @@ def candles_api():
                 "candles": records,
             }
         )
-    except ValueError:
-        return jsonify({"status": "error", "error": "Parámetros numéricos inválidos"}), 400
+    except ValueError as exc:
+        return jsonify({"status": "error", "error": str(exc)}), 400
     except Exception as exc:
         return jsonify({"status": "error", "error": str(exc)}), 500
 
@@ -154,15 +190,7 @@ def indicators_api():
     try:
         email = require_env("IQ_EMAIL")
         password = require_env("IQ_PASSWORD")
-        asset = request.args.get("asset", os.getenv("IQ_ASSET", "EURUSD")).strip().upper()
-        timeframe = int(request.args.get("timeframe", os.getenv("IQ_TIMEFRAME", "60")))
-        count = int(request.args.get("count", os.getenv("IQ_CANDLE_COUNT", "1000")))
-
-        if timeframe not in {5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600}:
-            return jsonify({"status": "error", "error": "Timeframe no permitido"}), 400
-
-        if count < 21 or count > 1000:
-            return jsonify({"status": "error", "error": "count debe estar entre 21 y 1000"}), 400
+        asset, timeframe, count = request_market_parameters(min_count=21)
 
         iq = connect_practice(email, password)
         frame = add_indicators(download_candles(iq, asset, timeframe, count))
@@ -182,8 +210,43 @@ def indicators_api():
                 "rsi14": None if pd.isna(latest["rsi14"]) else round(float(latest["rsi14"]), 2),
             }
         )
-    except ValueError:
-        return jsonify({"status": "error", "error": "Parámetros numéricos inválidos"}), 400
+    except ValueError as exc:
+        return jsonify({"status": "error", "error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"status": "error", "error": str(exc)}), 500
+
+
+@app.get("/api/signal")
+def signal_api():
+    try:
+        email = require_env("IQ_EMAIL")
+        password = require_env("IQ_PASSWORD")
+        asset, timeframe, count = request_market_parameters(min_count=21)
+
+        iq = connect_practice(email, password)
+        frame = add_indicators(download_candles(iq, asset, timeframe, count))
+        latest = frame.iloc[-1]
+        signal, reason = calculate_signal(frame)
+
+        return jsonify(
+            {
+                "status": "ok",
+                "mode": "PRACTICE_ONLY",
+                "execution_enabled": False,
+                "asset": asset,
+                "timeframe": timeframe,
+                "count": len(frame),
+                "datetime": str(latest["datetime"]),
+                "close": round(float(latest["close"]), 6),
+                "ema9": round(float(latest["ema9"]), 6),
+                "ema21": round(float(latest["ema21"]), 6),
+                "rsi14": None if pd.isna(latest["rsi14"]) else round(float(latest["rsi14"]), 2),
+                "signal": signal,
+                "reason": reason,
+            }
+        )
+    except ValueError as exc:
+        return jsonify({"status": "error", "error": str(exc)}), 400
     except Exception as exc:
         return jsonify({"status": "error", "error": str(exc)}), 500
 
