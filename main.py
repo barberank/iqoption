@@ -5,13 +5,17 @@ from pathlib import Path
 
 import pandas as pd
 from dotenv import load_dotenv
+from flask import Flask, jsonify, request
 from iqoptionapi.stable_api import IQ_Option
+
+load_dotenv()
+app = Flask(__name__)
 
 
 def require_env(name: str) -> str:
     value = os.getenv(name, "").strip()
     if not value:
-        raise RuntimeError(f"Falta configurar {name} en el archivo .env")
+        raise RuntimeError(f"Falta configurar {name} en las variables de entorno")
     return value
 
 
@@ -25,7 +29,7 @@ def connect_practice(email: str, password: str) -> IQ_Option:
     iq.change_balance("PRACTICE")
 
     if not iq.check_connect():
-        raise RuntimeError("La conexión se perdió después de iniciar sesión.")
+        raise RuntimeError("La conexión se perdió después de iniciar sesión")
 
     return iq
 
@@ -65,9 +69,60 @@ def download_candles(
     return frame[wanted].sort_values("datetime")
 
 
-def main() -> int:
-    load_dotenv()
+@app.get("/")
+def home():
+    return jsonify(
+        {
+            "status": "ok",
+            "service": "IQ Option AI MVP",
+            "mode": "PRACTICE_ONLY",
+            "message": "API online. Usá /api/candles para consultar velas demo.",
+        }
+    )
 
+
+@app.get("/api/health")
+def health():
+    return jsonify({"status": "ok", "mode": "PRACTICE_ONLY"})
+
+
+@app.get("/api/candles")
+def candles_api():
+    try:
+        email = require_env("IQ_EMAIL")
+        password = require_env("IQ_PASSWORD")
+        asset = request.args.get("asset", os.getenv("IQ_ASSET", "EURUSD")).strip().upper()
+        timeframe = int(request.args.get("timeframe", os.getenv("IQ_TIMEFRAME", "60")))
+        count = int(request.args.get("count", os.getenv("IQ_CANDLE_COUNT", "100")))
+
+        if timeframe not in {5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600}:
+            return jsonify({"status": "error", "error": "Timeframe no permitido"}), 400
+
+        if count < 1 or count > 1000:
+            return jsonify({"status": "error", "error": "count debe estar entre 1 y 1000"}), 400
+
+        iq = connect_practice(email, password)
+        frame = download_candles(iq, asset, timeframe, count)
+        records = frame.assign(datetime=frame["datetime"].astype(str)).to_dict(orient="records")
+
+        return jsonify(
+            {
+                "status": "ok",
+                "mode": "PRACTICE_ONLY",
+                "asset": asset,
+                "timeframe": timeframe,
+                "count": len(records),
+                "balance": iq.get_balance(),
+                "candles": records,
+            }
+        )
+    except ValueError:
+        return jsonify({"status": "error", "error": "Parámetros numéricos inválidos"}), 400
+    except Exception as exc:
+        return jsonify({"status": "error", "error": str(exc)}), 500
+
+
+def run_cli() -> int:
     email = require_env("IQ_EMAIL")
     password = require_env("IQ_PASSWORD")
     asset = os.getenv("IQ_ASSET", "EURUSD").strip().upper()
@@ -76,28 +131,24 @@ def main() -> int:
 
     print("Conectando a IQ Option...")
     iq = connect_practice(email, password)
-
     print("Conexión correcta.")
     print("Cuenta seleccionada: PRACTICE")
     print(f"Saldo demo: {iq.get_balance()}")
-    print(f"Descargando {count} velas de {asset}, timeframe {timeframe}s...")
 
     frame = download_candles(iq, asset, timeframe, count)
-
     output_dir = Path("data")
     output_dir.mkdir(exist_ok=True)
     output_file = output_dir / "candles.csv"
     frame.to_csv(output_file, index=False)
 
-    print("\nÚltimas 5 velas:")
     print(frame.tail(5).to_string(index=False))
-    print(f"\nArchivo creado: {output_file.resolve()}")
+    print(f"Archivo creado: {output_file.resolve()}")
     return 0
 
 
 if __name__ == "__main__":
     try:
-        raise SystemExit(main())
+        raise SystemExit(run_cli())
     except Exception as exc:
-        print(f"\nERROR: {exc}", file=sys.stderr)
+        print(f"ERROR: {exc}", file=sys.stderr)
         raise SystemExit(1)
