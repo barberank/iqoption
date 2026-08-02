@@ -126,6 +126,30 @@ def calculate_signal(frame: pd.DataFrame) -> tuple[str, str]:
     return "NO_TRADE", "No se cumplen simultáneamente las reglas de entrada"
 
 
+def calculate_trend(frame: pd.DataFrame) -> str:
+    latest = frame.iloc[-1]
+    ema9 = float(latest["ema9"])
+    ema21 = float(latest["ema21"])
+    tolerance = max(abs(ema21) * 0.00002, 0.000001)
+
+    if ema9 > ema21 + tolerance:
+        return "BULLISH"
+    if ema9 < ema21 - tolerance:
+        return "BEARISH"
+    return "SIDEWAYS"
+
+
+def candle_to_dict(row: pd.Series) -> dict:
+    return {
+        "datetime": str(row["datetime"]),
+        "open": round(float(row["open"]), 6),
+        "high": round(float(row["high"]), 6),
+        "low": round(float(row["low"]), 6),
+        "close": round(float(row["close"]), 6),
+        "volume": None if "volume" not in row or pd.isna(row["volume"]) else float(row["volume"]),
+    }
+
+
 def request_market_parameters(min_count: int = 1) -> tuple[str, int, int]:
     asset = request.args.get("asset", os.getenv("IQ_ASSET", "EURUSD")).strip().upper()
     timeframe = int(request.args.get("timeframe", os.getenv("IQ_TIMEFRAME", "60")))
@@ -147,7 +171,7 @@ def home():
             "status": "ok",
             "service": "IQ Option AI MVP",
             "mode": "PRACTICE_ONLY",
-            "message": "API online. Usá /api/candles, /api/indicators o /api/signal.",
+            "message": "API online. Usá /api/candles, /api/indicators, /api/signal o /api/market.",
         }
     )
 
@@ -243,6 +267,48 @@ def signal_api():
                 "rsi14": None if pd.isna(latest["rsi14"]) else round(float(latest["rsi14"]), 2),
                 "signal": signal,
                 "reason": reason,
+            }
+        )
+    except ValueError as exc:
+        return jsonify({"status": "error", "error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"status": "error", "error": str(exc)}), 500
+
+
+@app.get("/api/market")
+def market_api():
+    try:
+        email = require_env("IQ_EMAIL")
+        password = require_env("IQ_PASSWORD")
+        asset, timeframe, count = request_market_parameters(min_count=21)
+
+        iq = connect_practice(email, password)
+        frame = add_indicators(download_candles(iq, asset, timeframe, count))
+        latest = frame.iloc[-1]
+        signal, reason = calculate_signal(frame)
+        recent = [candle_to_dict(row) for _, row in frame.tail(20).iterrows()]
+
+        return jsonify(
+            {
+                "status": "ok",
+                "mode": "PRACTICE_ONLY",
+                "execution_enabled": False,
+                "asset": asset,
+                "timeframe": timeframe,
+                "count": len(frame),
+                "balance": iq.get_balance(),
+                "trend": calculate_trend(frame),
+                "indicators": {
+                    "ema9": round(float(latest["ema9"]), 6),
+                    "ema21": round(float(latest["ema21"]), 6),
+                    "rsi14": None if pd.isna(latest["rsi14"]) else round(float(latest["rsi14"]), 2),
+                },
+                "signal": {
+                    "value": signal,
+                    "reason": reason,
+                },
+                "last_candle": candle_to_dict(latest),
+                "last_20_candles": recent,
             }
         )
     except ValueError as exc:
